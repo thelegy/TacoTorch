@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+  "tacotorch",
+]
+
+[workspace.metadata.crane]
+name = "tacotorch-hub"
+
+[workspace.package]
+version = "0.1.0"
