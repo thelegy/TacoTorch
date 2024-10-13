@@ -30,7 +30,7 @@
       };
 
       selectToolchain = p:
-        p.rust-bin.stable.latest.default.override {
+        p.rust-bin.nightly.latest.default.override {
           extensions = ["rust-analyzer" "rust-src"];
         };
 

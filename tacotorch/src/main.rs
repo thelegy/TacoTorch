@@ -1,3 +1,5 @@
+#![feature(never_type)]
+
 use anyhow::{anyhow, Result};
 use core::panic;
 use rumqttc::{
@@ -12,7 +14,7 @@ use std::{
 use tokio::{sync::broadcast, task};
 
 pub struct Server {
-    subscriptions: Mutex<HashMap<&'static str, broadcast::Sender<Publish>>>,
+    subscriptions: Mutex<HashMap<String, broadcast::Sender<Publish>>>,
     pub mqtt: rumqttc::AsyncClient,
 }
 impl Server {
@@ -46,7 +48,7 @@ impl Server {
                         let sender_option = {
                             let subscriptions = self.subscriptions.lock().unwrap();
                             let topic: &str = &message.topic;
-                            subscriptions.get(&topic).cloned()
+                            subscriptions.get(topic).cloned()
                         };
                         if let Some(sender) = sender_option {
                             let _ = sender.send(message);
@@ -101,10 +103,13 @@ impl Server {
             .await?;
         Ok(())
     }
-    async fn subscribe(&self, topic: &'static str) -> Result<broadcast::Receiver<Publish>> {
+    async fn subscribe<S>(&self, topic: S) -> Result<broadcast::Receiver<Publish>>
+    where
+        S: Into<String> + Clone,
+    {
         let (receiver, needs_subscription) = {
             let mut subscriptions = self.subscriptions.lock().unwrap();
-            match subscriptions.entry(topic) {
+            match subscriptions.entry(topic.clone().into()) {
                 std::collections::hash_map::Entry::Occupied(x) => (x.get().subscribe(), false),
                 std::collections::hash_map::Entry::Vacant(x) => {
                     let (sender, receiver) = broadcast::channel(3);
@@ -138,6 +143,102 @@ impl Server {
             Err(anyhow!("Bad value for color transition"))
         }
     }
+    pub fn add_lamp<S1, S2>(self: &Arc<Self>, name: S1, z2m_prefix: S2) -> Result<Arc<Lamp>>
+    where
+        S1: Into<String>,
+        S2: Into<String>,
+    {
+        let lamp = Arc::new(Lamp {
+            server: self.clone(),
+            name: name.into(),
+            z2m_prefix: z2m_prefix.into(),
+        });
+        task::spawn({
+            let lamp = lamp.clone();
+            async move {
+                // TODO handle errors
+                let _ = tokio::join!(lamp.handle_set(), lamp.handle_lamp_state());
+            }
+        });
+        Ok(lamp)
+    }
+}
+
+pub struct Lamp {
+    server: Arc<Server>,
+    name: String,
+    z2m_prefix: String,
+}
+impl Lamp {
+    async fn set(&self, payload: &[u8]) -> Result<()> {
+        self.server
+            .publish(format!("zigbee2mqtt/{}/set", self.z2m_prefix), payload)
+            .await
+    }
+    async fn handle_set(&self) -> Result<!> {
+        let mut subscription = self
+            .server
+            .subscribe(format!("tacotorch/{}/set", self.name).to_owned())
+            .await?;
+        loop {
+            let message = subscription.recv().await.unwrap();
+            self.server
+                .publish(
+                    format!("zigbee2mqtt/{}/set", self.z2m_prefix),
+                    message.payload,
+                )
+                .await?;
+        }
+    }
+    async fn handle_lamp_state(&self) -> Result<!> {
+        let mut subscription = self
+            .server
+            .subscribe(format!("zigbee2mqtt/{}", self.z2m_prefix))
+            .await?;
+        loop {
+            let message = subscription.recv().await.unwrap();
+            self.server
+                .publish(format!("tacotorch/{}", self.name), message.payload)
+                .await?;
+        }
+    }
+    async fn advertise_ha(&self) -> Result<()> {
+        let availability = json!([
+            {"topic":"tacotorch/server/state","value_template":"{{ value_json.state }}"},
+            {"topic":"zigbee2mqtt/bridge/state","value_template":"{{ value_json.state }}"},
+            {
+                "topic": format!("zigbee2mqtt/{}/availability", self.z2m_prefix),
+                "value_template": "{{ value_json.state }}",
+            }
+        ]);
+
+        let id = format!("tacotorch_light_{}", self.name);
+
+        let device = json!({
+            "identifiers": [id],
+            "name": self.name,
+        });
+
+        let light_config = serde_json::to_vec(&json!({
+            "name": null,
+            "availability": availability,
+            "availability_mode": "all",
+            "brightness": true,
+            "state_topic": format!("tacotorch/{}", self.name),
+            "json_attributes_topic": format!("tacotorch/{}", self.name),
+            "command_topic": format!("tacotorch/{}/set", self.name),
+            "schema": "json",
+            "device": device,
+            "supported_color_modes": ["rgb"],
+            "unique_id": id,
+        }))?;
+
+        self.server
+            .publish(format!("homeassistant/light/{}/config", id), light_config)
+            .await?;
+
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -150,69 +251,10 @@ async fn main() -> Result<()> {
 
     let server = Server::new();
 
-    task::spawn({
-        let server = server.clone();
-        async move {
-            let mut subscription = server.subscribe("tacotorch/test/set").await.unwrap();
-            loop {
-                let message = subscription.recv().await.unwrap();
-                server
-                    .publish("zigbee2mqtt/Büro Accent 1/set", message.payload)
-                    .await
-                    .unwrap();
-            }
-        }
-    });
+    let lamp_test = server.add_lamp("test", "Büro Accent 1")?;
 
-    task::spawn({
-        let server = server.clone();
-        async move {
-            let mut subscription = server
-                .subscribe("zigbee2mqtt/Büro Accent 1/set")
-                .await
-                .unwrap();
-            loop {
-                let message = subscription.recv().await.unwrap();
-                server
-                    .publish("tacotorch/test", message.payload)
-                    .await
-                    .unwrap();
-            }
-        }
-    });
+    lamp_test.advertise_ha().await?;
 
-    let light_config = serde_json::to_vec(&json!({
-        "name": null,
-        "availability": [
-            {"topic":"tacotorch/server/state","value_template":"{{ value_json.state }}"},
-            {"topic":"zigbee2mqtt/bridge/state","value_template":"{{ value_json.state }}"},
-            {"topic":"zigbee2mqtt/Büro Accent 1/availability","value_template":"{{ value_json.state }}"}
-        ],
-        "availability_mode": "all",
-        "brightness": true,
-        "state_topic": "tacotorch/test",
-        "command_topic": "tacotorch/test/set",
-        "json_attributes_topic":"tacotorch/test",
-        "schema": "json",
-        "device": {
-            "identifiers": ["test4"],
-            "name": "test",
-            "manufacturer": "me",
-            "model": "Some Model",
-        },
-        "supported_color_modes":["rgb"],
-        "unique_id": "tacotorch_light_test",
-    }))?;
-
-    server
-        .mqtt
-        .publish(
-            "homeassistant/light/tacotorch_light_test/config",
-            QoS::AtLeastOnce,
-            false,
-            light_config,
-        )
-        .await?;
     loop {
         tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
     }
